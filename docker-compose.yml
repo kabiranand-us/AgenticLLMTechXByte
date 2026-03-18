@@ -1,0 +1,11 @@
+version: '3.8'
+
+services:
+  llm-gateway:
+    image: anandkabirus/llm-gateway:latest
+    container_name: llm-gateway
+    restart: always
+    ports:
+      - "8089:8000"
+    env_file:
+      - .env

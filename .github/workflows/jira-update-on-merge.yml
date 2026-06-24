@@ -42,4 +42,5 @@ jobs:
           PR_URL: ${{ github.event.pull_request.html_url }}
           PR_TITLE: ${{ github.event.pull_request.title }}
           CHANGED_FILES: ${{ steps.changed-files.outputs.files }}
+          JIRA_TARGET_TRANSITION_NAMES: ${{ vars.JIRA_TARGET_TRANSITION_NAMES }}
         run: python3 scripts/jira_update_on_merge.py

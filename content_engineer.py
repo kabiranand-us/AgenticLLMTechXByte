@@ -1,7 +1,7 @@
 import json
 import logging
 from typing import Dict, Any, Tuple, Optional
-from llm_service import LLMFactory
+from llm_service import invoke_with_fallback
 
 logger = logging.getLogger(__name__)
 
@@ -60,28 +60,12 @@ Instruction: When I provide a topic, output the final JSON payload only. Do not 
             - Model Used (str)
             - Metadata (Dict)
         """
-        llm, provider_used, model_used = LLMFactory.get_llm(
-            provider=provider, 
-            model_name=model_name, 
-            prefer_model=prefer_model
-        )
-        
         prompt = f"{ContentEngineer.SYSTEM_PROMPT}\n\nTopic: [{topic}]"
-        
-        try:
-            ai_message = llm.invoke(prompt)
-        except Exception as e:
-            error_msg = str(e).lower()
-            if "resource_exhausted" in error_msg or "429" in error_msg:
-                logger.warning(f"Rate limit hit for {provider_used} ({model_used}). Falling back to Groq...")
-                llm, provider_used, model_used = LLMFactory.get_llm(
-                    "groq", 
-                    model_name="llama-3.1-8b-instant"
-                )
-                ai_message = llm.invoke(prompt)
-            else:
-                raise e
-                
+
+        ai_message, provider_used, model_used = invoke_with_fallback(
+            prompt, provider, model_name, prefer_model
+        )
+
         response_text = ai_message.content
         if isinstance(response_text, list):
             response_text = "".join(

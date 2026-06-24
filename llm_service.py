@@ -29,6 +29,7 @@ FALLBACK_CHAIN = (
     ("groq", "allam-2-7b"),
     ("groq", "groq/compound"),
     ("groq", "groq/compound-mini"),
+    ("openrouter", "qwen/qwen3-coder:free"),
     ("mistral", "mistral-small-latest"),
 )
 # Selectable model IDs for prefer_model (same order as chain; for API docs/dropdown).
@@ -47,6 +48,13 @@ _GROQ_FALLBACK_CHAIN = (
 )
 # Per-model state: model_id -> {"timestamps": [...], "daily": {date_str: count}}
 _groq_chain_state: dict = {}
+
+# --- OpenRouter free-tier fallback (after Groq chain exhausted). Conservative defaults;
+# actual per-model limits vary, see https://openrouter.ai/docs/limits. ---
+_OPENROUTER_RPM = 20
+_OPENROUTER_RPD = 1000
+_openrouter_timestamps: list = []
+_openrouter_daily: dict = {}
 
 # --- Mistral AI fallback (after Groq chain exhausted). Free tier ~1 RPS, 500K TPM. ---
 _MISTRAL_FALLBACK_RPM = 60
@@ -126,6 +134,39 @@ def _pick_groq_fallback_model(groq_start_index: int = 0) -> Tuple[str, bool]:
     if not chain_slice:
         return (_GROQ_FALLBACK_CHAIN[-1][0], False)
     return (chain_slice[-1][0], False)
+
+
+def _is_openrouter_over_limit() -> bool:
+    """True if OpenRouter free-tier usage is at or over 20 RPM / 1000 RPD."""
+    with _limiter_lock:
+        now = time.time()
+        pacific_date = _pacific_date()
+        global _openrouter_timestamps, _openrouter_daily
+        _openrouter_timestamps = [t for t in _openrouter_timestamps if now - t < 60]
+        if len(_openrouter_timestamps) >= _OPENROUTER_RPM:
+            return True
+        if _openrouter_daily.get(pacific_date, 0) >= _OPENROUTER_RPD:
+            return True
+        return False
+
+
+def _record_openrouter_usage() -> None:
+    """Record one request against the OpenRouter free-tier budget."""
+    with _limiter_lock:
+        pacific_date = _pacific_date()
+        _openrouter_timestamps.append(time.time())
+        _openrouter_daily[pacific_date] = _openrouter_daily.get(pacific_date, 0) + 1
+
+
+def _get_openrouter_llm(model_name: str = "qwen/qwen3-coder:free") -> Tuple[BaseChatModel, str]:
+    """Build an OpenRouter-backed ChatOpenAI instance (OpenAI-compatible API). Returns (llm, model_used)."""
+    llm = ChatOpenAI(
+        model=model_name,
+        api_key=settings.OPENROUTER_API_KEY,
+        base_url=settings.OPENROUTER_BASE_URL,
+        temperature=0.7,
+    )
+    return (llm, model_name)
 
 
 def _is_mistral_fallback_over_limit() -> bool:
@@ -225,6 +266,12 @@ class LLMFactory:
                         return (llm, "groq", groq_model)
                     # Groq slice exhausted; continue to Mistral if in chain
                     continue
+                if prov == "openrouter" and settings.OPENROUTER_API_KEY:
+                    if not _is_openrouter_over_limit():
+                        _record_openrouter_usage()
+                        llm, or_model = _get_openrouter_llm(mid)
+                        return (llm, "openrouter", or_model)
+                    continue
                 if prov == "mistral" and settings.MISTRAL_API_KEY:
                     if not _is_mistral_fallback_over_limit():
                         _record_mistral_fallback_usage()
@@ -307,4 +354,56 @@ class LLMFactory:
             llm, _ = _get_mistral_llm(model)
             return (llm, "mistral", model)
 
-        raise ValueError(f"Unsupported provider: {provider}. Supported: google, groq, anthropic, deepseek, mistral.")
+        if provider == "openrouter":
+            if not settings.OPENROUTER_API_KEY:
+                raise ValueError("OpenRouter API Key is not set. Set OPENROUTER_API_KEY in .env.")
+            model = model_name or "qwen/qwen3-coder:free"
+            llm, _ = _get_openrouter_llm(model)
+            return (llm, "openrouter", model)
+
+        raise ValueError(f"Unsupported provider: {provider}. Supported: google, groq, anthropic, deepseek, mistral, openrouter.")
+
+
+def _is_rate_limit_error(e: Exception) -> bool:
+    msg = str(e).lower()
+    return "resource_exhausted" in msg or "429" in msg or "rate limit" in msg
+
+
+def invoke_with_fallback(message: str, provider: str = "google", model_name: str = None, prefer_model: str = None):
+    """
+    Invoke an LLM, cascading through the *entire* remaining FALLBACK_CHAIN on real
+    rate-limit failures (not just one hardcoded retry step). Only meaningful when
+    using the google/gemini-2.5-flash-lite entry point, since that's what drives
+    the chain; other providers are tried once as-is.
+
+    Returns (ai_message, provider_used, model_used).
+    """
+    llm, provider_used, model_used = LLMFactory.get_llm(provider, model_name, prefer_model=prefer_model)
+    using_chain = (provider.lower() == "google" and (model_name in (None, "gemini-2.5-flash-lite")))
+
+    last_exc = None
+    try:
+        ai_message = llm.invoke(message)
+        return (ai_message, provider_used, model_used)
+    except Exception as e:
+        last_exc = e
+        if not (using_chain and _is_rate_limit_error(e)):
+            raise
+
+    # Walk the rest of the chain, starting just after the model that just failed.
+    start_index = _fallback_chain_start_index(model_used) + 1
+    for i in range(start_index, len(FALLBACK_CHAIN)):
+        _prov, mid = FALLBACK_CHAIN[i]
+        try:
+            llm, provider_used, model_used = LLMFactory.get_llm(
+                "google", "gemini-2.5-flash-lite", prefer_model=mid
+            )
+            ai_message = llm.invoke(message)
+            return (ai_message, provider_used, model_used)
+        except Exception as e:
+            last_exc = e
+            if not _is_rate_limit_error(e):
+                raise
+            continue
+
+    raise last_exc

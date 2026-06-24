@@ -8,10 +8,12 @@ class Settings(BaseSettings):
     ANTHROPIC_API_KEY: Optional[str] = None
     DEEPSEEK_API_KEY: Optional[str] = None
     MISTRAL_API_KEY: Optional[str] = None
+    OPENROUTER_API_KEY: Optional[str] = None
     TECHXBYTES_API_KEY: Optional[str] = None
-    
+
     # Configuration
     DEEPSEEK_BASE_URL: str = "https://api.deepseek.com/v1"
+    OPENROUTER_BASE_URL: str = "https://openrouter.ai/api/v1"
     APP_ENV: str = "development"
     PORT: int = 8080
 

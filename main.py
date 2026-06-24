@@ -6,7 +6,7 @@ import uvicorn
 from contextlib import asynccontextmanager
 
 from config import settings
-from llm_service import LLMFactory, SELECTABLE_FALLBACK_MODELS
+from llm_service import LLMFactory, SELECTABLE_FALLBACK_MODELS, invoke_with_fallback
 from ollama_manager import router as ollama_router, init_idle_monitor
 
 # --- Pydantic Models ---
@@ -91,7 +91,7 @@ async def list_fallback_models():
 @app.post("/api/chat", response_model=ChatResponse)
 async def chat_endpoint(request: ChatRequest):
     try:
-        # 1. Get the appropriate LLM from the factory
+        # 1. Normalize inputs
         model_name = request.model_name
         if model_name == "string":
             model_name = None
@@ -99,27 +99,11 @@ async def chat_endpoint(request: ChatRequest):
         if prefer_model == "string":
             prefer_model = None
 
-        llm, provider_used, model_used = LLMFactory.get_llm(
-            request.provider, model_name, prefer_model=prefer_model
+        # 2. Invoke, cascading through the full fallback chain on real rate-limit errors
+        ai_message, provider_used, model_used = invoke_with_fallback(
+            request.message, request.provider, model_name, prefer_model
         )
-        
-        # 2. Invoke the model
-        # LangChain's invoke method returns an AIMessage object
-        try:
-            ai_message = llm.invoke(request.message)
-        except Exception as e:
-            error_msg = str(e).lower()
-            if "resource_exhausted" in error_msg or "429" in error_msg:
-                print(f"Rate limit hit for {provider_used} ({model_used}). Falling back to Groq...")
-                # Fallback directly to a reliable Groq model with high rate limits
-                llm, provider_used, model_used = LLMFactory.get_llm(
-                    "groq", 
-                    model_name="llama-3.1-8b-instant"
-                )
-                ai_message = llm.invoke(request.message)
-            else:
-                raise e
-        
+
         # 3. Extract content
         response_text = ai_message.content
         if isinstance(response_text, list):

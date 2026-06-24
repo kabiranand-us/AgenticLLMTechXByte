@@ -11,6 +11,15 @@ import threading
 from typing import Tuple
 from datetime import datetime
 from zoneinfo import ZoneInfo
+from prometheus_client import Counter
+
+# Total LLM invocations, labeled by provider, model, and outcome (success/error).
+# Powers the Grafana dashboard: totals-by-model, error percentage, and requests-over-time.
+LLM_REQUESTS_TOTAL = Counter(
+    "llm_requests_total",
+    "Total LLM invocations via invoke_with_fallback",
+    ["provider", "model", "status"],
+)
 
 # --- Gemini 2.5 Flash-Lite free tier: 15 RPM, 1000 RPD (resets midnight Pacific) ---
 _FLASH_LITE_RPM = 15
@@ -394,9 +403,11 @@ def invoke_with_fallback(message: str, provider: str = "google", model_name: str
     last_exc = None
     try:
         ai_message = llm.invoke(message)
+        LLM_REQUESTS_TOTAL.labels(provider=provider_used, model=model_used, status="success").inc()
         return (ai_message, provider_used, model_used)
     except Exception as e:
         last_exc = e
+        LLM_REQUESTS_TOTAL.labels(provider=provider_used, model=model_used, status="error").inc()
         if not (using_chain and _is_rate_limit_error(e)):
             raise
 
@@ -409,9 +420,11 @@ def invoke_with_fallback(message: str, provider: str = "google", model_name: str
                 "google", "gemini-2.5-flash-lite", prefer_model=mid
             )
             ai_message = llm.invoke(message)
+            LLM_REQUESTS_TOTAL.labels(provider=provider_used, model=model_used, status="success").inc()
             return (ai_message, provider_used, model_used)
         except Exception as e:
             last_exc = e
+            LLM_REQUESTS_TOTAL.labels(provider=provider_used, model=model_used, status="error").inc()
             if not _is_rate_limit_error(e):
                 raise
             continue

@@ -1,9 +1,11 @@
 from fastapi import FastAPI, HTTPException, Body
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import Response
 from pydantic import BaseModel
 from typing import Optional, Dict, Any
 import uvicorn
 from contextlib import asynccontextmanager
+from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
 
 from config import settings
 from llm_service import LLMFactory, SELECTABLE_FALLBACK_MODELS, invoke_with_fallback
@@ -81,6 +83,11 @@ app.add_middleware(
 @app.get("/health")
 async def health_check():
     return {"status": "ok", "env": settings.APP_ENV}
+
+
+@app.get("/metrics")
+async def metrics():
+    return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
 
 @app.get("/api/models")

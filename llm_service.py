@@ -250,6 +250,7 @@ class LLMFactory:
                             model="gemini-2.5-flash-lite",
                             google_api_key=settings.GOOGLE_API_KEY,
                             temperature=0.7,
+                            max_retries=1,
                             convert_system_message_to_human=True,
                         )
                         return (llm, "google", "gemini-2.5-flash-lite")
@@ -297,6 +298,7 @@ class LLMFactory:
                 model="gemini-2.5-flash-lite",
                 google_api_key=settings.GOOGLE_API_KEY,
                 temperature=0.7,
+                max_retries=1,
                 convert_system_message_to_human=True,
             )
             return (llm, "google", "gemini-2.5-flash-lite")
@@ -309,6 +311,7 @@ class LLMFactory:
                 model=model,
                 google_api_key=settings.GOOGLE_API_KEY,
                 temperature=0.7,
+                max_retries=1,
                 convert_system_message_to_human=True,
             )
             return (llm, "google", model)
@@ -366,7 +369,14 @@ class LLMFactory:
 
 def _is_rate_limit_error(e: Exception) -> bool:
     msg = str(e).lower()
-    return "resource_exhausted" in msg or "429" in msg or "rate limit" in msg
+    return (
+        "resource_exhausted" in msg
+        or "429" in msg
+        or "rate limit" in msg
+        or "503" in msg
+        or "unavailable" in msg
+        or "overloaded" in msg
+    )
 
 
 def invoke_with_fallback(message: str, provider: str = "google", model_name: str = None, prefer_model: str = None):

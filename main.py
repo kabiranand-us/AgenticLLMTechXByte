@@ -64,11 +64,13 @@ app = FastAPI(
 app.include_router(ollama_router)
 
 # --- CORS Middleware ---
-# Allow all origins for development convenience. 
-# In production, restrict this to the specific React app domain.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[
+        "https://techxbytes.com",
+        "https://www.techxbytes.com",
+        "http://localhost:3001",
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

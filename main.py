@@ -56,7 +56,7 @@ async def lifespan(application: FastAPI):
 app = FastAPI(
     title="Unified LLM Gateway",
     description="API Gateway for multiple LLM providers (Gemini, Groq, Claude, DeepSeek)",
-    version="1.0.0",
+    version="1.0.1",
     lifespan=lifespan
 )
 

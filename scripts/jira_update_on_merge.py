@@ -11,6 +11,9 @@ locally without GitHub Actions:
   JIRA_BASE_URL, JIRA_EMAIL, JIRA_API_TOKEN  - Jira Cloud REST API credentials
   PR_BODY, PR_URL, PR_TITLE                  - from the merged PR
   CHANGED_FILES                              - newline-separated list (optional)
+  JIRA_TARGET_TRANSITION_NAMES               - comma-separated target status names to
+                                                treat as "done" for this project's workflow
+                                                (optional, defaults to done,closed,resolved)
 """
 import os
 import re
@@ -70,16 +73,17 @@ def post_comment(base_url: str, headers: dict, ticket_key: str, text: str) -> No
     _request("POST", f"{base_url}/rest/api/3/issue/{ticket_key}/comment", headers, body)
 
 
-def transition_to_done(base_url: str, headers: dict, ticket_key: str) -> None:
-    """Best-effort: find a transition whose target status looks like 'done' and apply it.
+def transition_to_done(base_url: str, headers: dict, ticket_key: str, target_names: list[str]) -> None:
+    """Best-effort: find a transition whose target status matches target_names and apply it.
     Does nothing (and doesn't fail the run) if no such transition exists - workflows vary
     per Jira project, and we'd rather skip than guess wrong."""
     data = _request("GET", f"{base_url}/rest/api/3/issue/{ticket_key}/transitions", headers)
     transitions = data.get("transitions", [])
 
+    wanted = {name.strip().lower() for name in target_names if name.strip()}
     done_like = [
         t for t in transitions
-        if t.get("to", {}).get("name", "").strip().lower() in ("done", "closed", "resolved")
+        if t.get("to", {}).get("name", "").strip().lower() in wanted
     ]
     if not done_like:
         print(f"No done-like transition available for {ticket_key}; skipping status change. "
@@ -117,7 +121,9 @@ def main() -> int:
     post_comment(base_url, headers, ticket_key, comment_text)
     print(f"Commented on {ticket_key}")
 
-    transition_to_done(base_url, headers, ticket_key)
+    target_names_raw = os.environ.get("JIRA_TARGET_TRANSITION_NAMES", "").strip()
+    target_names = target_names_raw.split(",") if target_names_raw else ["done", "closed", "resolved"]
+    transition_to_done(base_url, headers, ticket_key, target_names)
     return 0
 
 

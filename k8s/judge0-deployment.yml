@@ -1,0 +1,69 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: judge0
+  namespace: judge0
+  labels:
+    app: judge0
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: judge0
+  template:
+    metadata:
+      labels:
+        app: judge0
+    spec:
+      containers:
+      - name: judge0-server
+        image: judge0/judge0:1.13.0
+        command: ["/usr/bin/tini", "--", "script/server"]
+        ports:
+        - containerPort: 2358
+        env:
+        - name: DATABASE_HOST
+          value: "postgres"
+        - name: DATABASE_PORT
+          value: "5432"
+        - name: DATABASE_NAME
+          value: "judge0_db"
+        - name: DATABASE_USERNAME
+          value: "judge0"
+        - name: DATABASE_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: judge0-secrets
+              key: POSTGRES_PASSWORD
+        - name: REDIS_HOST
+          value: "redis"
+        - name: REDIS_PORT
+          value: "6379"
+      - name: judge0-worker
+        image: judge0/judge0:1.13.0
+        command: ["/usr/bin/tini", "--", "script/worker"]
+        env:
+        - name: DATABASE_HOST
+          value: "postgres"
+        - name: DATABASE_PORT
+          value: "5432"
+        - name: DATABASE_NAME
+          value: "judge0_db"
+        - name: DATABASE_USERNAME
+          value: "judge0"
+        - name: DATABASE_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: judge0-secrets
+              key: POSTGRES_PASSWORD
+        - name: REDIS_HOST
+          value: "redis"
+        - name: REDIS_PORT
+          value: "6379"
+        resources:
+          limits:
+            cpu: "1"
+            memory: "512Mi"
+          requests:
+            cpu: "500m"
+            memory: "256Mi"

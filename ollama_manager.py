@@ -26,6 +26,9 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/ollama", tags=["Ollama SaladCloud"])
 
 # State
+def is_salad_configured():
+    return SALAD_API_KEY and SALAD_API_KEY != 'your_salad_api_key_here'
+
 last_request_time = time.time()
 container_lock = asyncio.Lock()
 
@@ -49,6 +52,9 @@ def stop_container():
     response.raise_for_status()
 
 async def check_and_start_container():
+    if not is_salad_configured():
+        logger.info("Salad API Key not configured. Skipping container status check.")
+        return
     async with container_lock:
         status = get_container_status()
         
@@ -95,6 +101,9 @@ async def idle_monitor():
                 logger.error(f"Error checking status in idle monitor: {e}")
 
 def init_idle_monitor():
+    if not is_salad_configured():
+        logger.info("Salad API Key not configured. Disabling Salad idle monitor.")
+        return
     # Reset last_request_time on startup
     global last_request_time
     last_request_time = time.time()

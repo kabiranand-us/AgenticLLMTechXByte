@@ -8,7 +8,7 @@ from contextlib import asynccontextmanager
 from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
 
 from config import settings
-from llm_service import LLMFactory, SELECTABLE_FALLBACK_MODELS, invoke_with_fallback
+from llm_service import LLMFactory, SELECTABLE_FALLBACK_MODELS, invoke_with_fallback, CHAT_SYSTEM_PROMPT
 from ollama_manager import router as ollama_router, init_idle_monitor
 
 # --- Pydantic Models ---
@@ -106,9 +106,11 @@ async def chat_endpoint(request: ChatRequest):
         if prefer_model == "string":
             prefer_model = None
 
-        # 2. Invoke, cascading through the full fallback chain on real rate-limit errors
+        # 2. Invoke, cascading through the full fallback chain on real rate-limit errors.
+        #    Send the chat system prompt so architectural answers come back as Mermaid.
         ai_message, provider_used, model_used = invoke_with_fallback(
-            request.message, request.provider, model_name, prefer_model
+            request.message, request.provider, model_name, prefer_model,
+            system_prompt=CHAT_SYSTEM_PROMPT,
         )
 
         # 3. Extract content

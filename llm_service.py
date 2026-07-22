@@ -4,6 +4,7 @@ from langchain_openai import ChatOpenAI
 from langchain_groq import ChatGroq
 from langchain_mistralai import ChatMistralAI
 from langchain_core.language_models.chat_models import BaseChatModel
+from langchain_core.messages import HumanMessage, SystemMessage
 from config import settings
 import os
 import time
@@ -19,6 +20,23 @@ LLM_REQUESTS_TOTAL = Counter(
     "llm_requests_total",
     "Total LLM invocations via invoke_with_fallback",
     ["provider", "model", "status"],
+)
+
+# System prompt for the /api/chat surface (AI-Explain, Q&A answers). The frontend
+# renders ```mermaid fenced blocks as SVG, so instruct the model to emit diagrams
+# as text-based Mermaid when a question is architectural — never as an image.
+CHAT_SYSTEM_PROMPT = (
+    "You are a helpful software engineering assistant. Answer in clear, well-structured "
+    "Markdown (short paragraphs, bullet lists, and `inline code` where useful).\n\n"
+    "When the answer involves system design, architecture, request/data flow, sequences, "
+    "state machines, or entity relationships, include a diagram as a fenced ```mermaid code "
+    "block. Rules for diagrams:\n"
+    "- Pick the fitting type: flowchart, sequenceDiagram, stateDiagram-v2, erDiagram, or C4Context.\n"
+    "- Keep node labels short and use plain ASCII only. Do NOT put parentheses (), angle "
+    "brackets <>, quotes, or emojis inside labels — they break the Mermaid parser.\n"
+    "- Place the diagram alongside the explanation, not only at the very end.\n"
+    "- Only include a diagram when it genuinely aids understanding.\n"
+    "- Never output an image, image link, or base64 image — diagrams must be Mermaid text."
 )
 
 # --- Gemini 2.5 Flash-Lite free tier: 15 RPM, 1000 RPD (resets midnight Pacific) ---
@@ -388,21 +406,30 @@ def _is_rate_limit_error(e: Exception) -> bool:
     )
 
 
-def invoke_with_fallback(message: str, provider: str = "google", model_name: str = None, prefer_model: str = None):
+def invoke_with_fallback(message: str, provider: str = "google", model_name: str = None, prefer_model: str = None, system_prompt: str = None):
     """
     Invoke an LLM, cascading through the *entire* remaining FALLBACK_CHAIN on real
     rate-limit failures (not just one hardcoded retry step). Only meaningful when
     using the google/gemini-2.5-flash-lite entry point, since that's what drives
     the chain; other providers are tried once as-is.
 
+    If ``system_prompt`` is provided, it is sent as a system message ahead of the
+    user message (Gemini converts it to a human turn automatically).
+
     Returns (ai_message, provider_used, model_used).
     """
     llm, provider_used, model_used = LLMFactory.get_llm(provider, model_name, prefer_model=prefer_model)
     using_chain = (provider.lower() == "google" and (model_name in (None, "gemini-2.5-flash-lite")))
 
+    # Build the invocation payload: a plain string, or system+human messages.
+    payload = message if not system_prompt else [
+        SystemMessage(content=system_prompt),
+        HumanMessage(content=message),
+    ]
+
     last_exc = None
     try:
-        ai_message = llm.invoke(message)
+        ai_message = llm.invoke(payload)
         LLM_REQUESTS_TOTAL.labels(provider=provider_used, model=model_used, status="success").inc()
         return (ai_message, provider_used, model_used)
     except Exception as e:
@@ -419,7 +446,7 @@ def invoke_with_fallback(message: str, provider: str = "google", model_name: str
             llm, provider_used, model_used = LLMFactory.get_llm(
                 "google", "gemini-2.5-flash-lite", prefer_model=mid
             )
-            ai_message = llm.invoke(message)
+            ai_message = llm.invoke(payload)
             LLM_REQUESTS_TOTAL.labels(provider=provider_used, model=model_used, status="success").inc()
             return (ai_message, provider_used, model_used)
         except Exception as e:

@@ -4,6 +4,7 @@ from typing import Optional
 class Settings(BaseSettings):
     # API Keys
     GOOGLE_API_KEY: Optional[str] = None
+    GEMINI_API_KEY: Optional[str] = None
     GROQ_API_KEY: Optional[str] = None
     ANTHROPIC_API_KEY: Optional[str] = None
     DEEPSEEK_API_KEY: Optional[str] = None
@@ -21,6 +22,10 @@ class Settings(BaseSettings):
     OPENROUTER_BASE_URL: str = "https://openrouter.ai/api/v1"
     APP_ENV: str = "development"
     PORT: int = 8080
+
+    @property
+    def resolved_google_api_key(self) -> Optional[str]:
+        return self.GOOGLE_API_KEY or self.GEMINI_API_KEY or os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY")
 
     model_config = SettingsConfigDict(
         env_file=".env", 

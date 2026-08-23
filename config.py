@@ -11,6 +11,11 @@ class Settings(BaseSettings):
     OPENROUTER_API_KEY: Optional[str] = None
     TECHXBYTES_API_KEY: Optional[str] = None
 
+    # Google Cloud (Vertex AI) - Prioritized to consume $300 GCP Credits first
+    USE_VERTEX_AI: bool = True
+    GCP_PROJECT_ID: Optional[str] = "project-8e0caa5b-233c-4e40-823"
+    GCP_LOCATION: str = "us-central1"
+
     # Configuration
     DEEPSEEK_BASE_URL: str = "https://api.deepseek.com/v1"
     OPENROUTER_BASE_URL: str = "https://openrouter.ai/api/v1"

@@ -1,4 +1,10 @@
 from langchain_google_genai import ChatGoogleGenerativeAI
+try:
+    from langchain_google_vertexai import ChatVertexAI
+    VERTEX_AVAILABLE = True
+except ImportError:
+    VERTEX_AVAILABLE = False
+
 from langchain_anthropic import ChatAnthropic
 from langchain_openai import ChatOpenAI
 from langchain_groq import ChatGroq
@@ -8,11 +14,14 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from config import settings
 import os
 import time
+import logging
 import threading
 from typing import Tuple
 from datetime import datetime
 from zoneinfo import ZoneInfo
 from prometheus_client import Counter
+
+logger = logging.getLogger(__name__)
 
 # Total LLM invocations, labeled by provider, model, and outcome (success/error).
 # Powers the Grafana dashboard: totals-by-model, error percentage, and requests-over-time.
@@ -65,8 +74,9 @@ _FLASH_LITE_RPD = 1000
 _flash_lite_timestamps: list = []
 _flash_lite_daily: dict = {}  # date_str (Pacific) -> count
 
-# --- Full fallback chain: (provider, model_id). User can optionally start from any via prefer_model. ---
+# --- Full fallback chain: (provider, model_id). Prioritizes Vertex AI ($300 GCP Credits) -> Google AI Studio -> Groq -> OpenRouter -> Mistral ---
 FALLBACK_CHAIN = (
+    ("vertex", "gemini-2.5-flash"),
     ("google", "gemini-2.5-flash-lite"),
     ("groq", "llama-3.3-70b-versatile"),
     ("groq", "llama-3.1-8b-instant"),
@@ -82,7 +92,7 @@ FALLBACK_CHAIN = (
 # Selectable model IDs for prefer_model (same order as chain; for API docs/dropdown).
 SELECTABLE_FALLBACK_MODELS = [model_id for _, model_id in FALLBACK_CHAIN]
 
-# Groq sub-chain: (model_id, rpm, rpd) — indices align with groq entries in FALLBACK_CHAIN (1..8).
+# Groq sub-chain: (model_id, rpm, rpd) — indices align with groq entries in FALLBACK_CHAIN (2..9).
 _GROQ_FALLBACK_CHAIN = (
     ("llama-3.3-70b-versatile", 30, 1000),
     ("llama-3.1-8b-instant", 30, 14400),
@@ -96,8 +106,7 @@ _GROQ_FALLBACK_CHAIN = (
 # Per-model state: model_id -> {"timestamps": [...], "daily": {date_str: count}}
 _groq_chain_state: dict = {}
 
-# --- OpenRouter free-tier fallback (after Groq chain exhausted). Conservative defaults;
-# actual per-model limits vary, see https://openrouter.ai/docs/limits. ---
+# --- OpenRouter free-tier fallback (after Groq chain exhausted). ---
 _OPENROUTER_RPM = 20
 _OPENROUTER_RPD = 1000
 _openrouter_timestamps: list = []
@@ -248,6 +257,23 @@ def _get_mistral_llm(model_name: str = "mistral-small-latest") -> Tuple[BaseChat
     return (llm, model_name)
 
 
+def _get_vertex_llm(model_name: str = "gemini-2.5-flash") -> Tuple[BaseChatModel, str]:
+    """Build a Vertex AI-backed ChatVertexAI instance using GCP Project credentials ($300 credits)."""
+    if not (settings.USE_VERTEX_AI and settings.GCP_PROJECT_ID):
+        raise ValueError("Vertex AI is disabled or GCP_PROJECT_ID is not set.")
+    if not VERTEX_AVAILABLE:
+        raise ValueError("langchain_google_vertexai is not installed.")
+    
+    llm = ChatVertexAI(
+        model_name=model_name,
+        project=settings.GCP_PROJECT_ID,
+        location=settings.GCP_LOCATION,
+        temperature=0.7,
+        max_retries=1,
+    )
+    return (llm, model_name)
+
+
 def _fallback_chain_start_index(prefer_model: str | None) -> int:
     """Return index into FALLBACK_CHAIN to start from (0 = full auto). prefer_model is model_id."""
     if not (prefer_model and (prefer_model := prefer_model.strip())):
@@ -267,14 +293,12 @@ class LLMFactory:
     ) -> Tuple[BaseChatModel, str, str]:
         """
         Factory method to get the appropriate LLM based on the provider.
-        When using Google with gemini-2.5-flash-lite, uses the fallback chain; optional
-        prefer_model starts the chain from that model (e.g. "llama-3.1-8b-instant").
+        Prioritizes Vertex AI ($300 GCP Credits) -> Google AI Studio -> Groq -> OpenRouter -> Mistral.
 
         Args:
-            provider: The provider ('google', 'anthropic', 'deepseek', 'groq', 'mistral').
+            provider: The provider ('google', 'vertex', 'anthropic', 'deepseek', 'groq', 'mistral', 'openrouter').
             model_name: The specific model name. If None, uses a default for the provider.
-            prefer_model: Optional. For flash-lite flow, start fallback from this model id
-                (one of SELECTABLE_FALLBACK_MODELS). Use "auto" or omit for full chain from Flash-Lite.
+            prefer_model: Optional model id in FALLBACK_CHAIN to start from.
 
         Returns:
             Tuple[BaseChatModel, str, str]: (llm, provider_used, model_used).
@@ -285,25 +309,45 @@ class LLMFactory:
         if prefer_model and prefer_model.lower() == "auto":
             prefer_model = None
 
-        # Gemini 2.5 Flash-Lite with optional prefer_model: follow fallback chain from start_index
-        if provider == "google" and (model_name == "gemini-2.5-flash-lite" or not model_name):
+        # Direct vertex request
+        if provider == "vertex":
+            model = model_name or "gemini-2.5-flash"
+            llm, vertex_model = _get_vertex_llm(model)
+            return (llm, "vertex", vertex_model)
+
+        # Gemini flash / flash-lite flow: follow fallback chain starting from index
+        if provider == "google" and (model_name in ("gemini-2.5-flash-lite", "gemini-2.5-flash", None)):
             start_index = _fallback_chain_start_index(prefer_model)
             for i in range(start_index, len(FALLBACK_CHAIN)):
                 prov, mid = FALLBACK_CHAIN[i]
+                
+                # 1. Tier 1: Vertex AI (Consumes $300 GCP Credits)
+                if prov == "vertex":
+                    if settings.USE_VERTEX_AI and settings.GCP_PROJECT_ID and VERTEX_AVAILABLE:
+                        try:
+                            llm, vmodel = _get_vertex_llm(mid)
+                            return (llm, "vertex", vmodel)
+                        except Exception as ex:
+                            logger.warning(f"Vertex AI initialization skipped ({ex}), falling back to Google AI Studio.")
+                    continue
+
+                # 2. Tier 2: Google AI Studio (Free Tier via API Key)
                 if prov == "google":
                     if not _is_flash_lite_over_limit() and settings.GOOGLE_API_KEY:
                         _record_flash_lite_usage()
                         llm = ChatGoogleGenerativeAI(
-                            model="gemini-2.5-flash-lite",
+                            model=mid,
                             google_api_key=settings.GOOGLE_API_KEY,
                             temperature=0.7,
                             max_retries=1,
                             convert_system_message_to_human=True,
                         )
-                        return (llm, "google", "gemini-2.5-flash-lite")
+                        return (llm, "google", mid)
                     continue
+
+                # 3. Tier 3: Groq Free / High-Speed Sub-chain
                 if prov == "groq" and settings.GROQ_API_KEY:
-                    groq_start = i - 1  # first groq in FALLBACK_CHAIN is at index 1
+                    groq_start = max(0, i - 2)
                     groq_model, groq_ok = _pick_groq_fallback_model(groq_start)
                     if groq_ok:
                         llm = ChatGroq(
@@ -312,25 +356,41 @@ class LLMFactory:
                             temperature=0.7,
                         )
                         return (llm, "groq", groq_model)
-                    # Groq slice exhausted; continue to Mistral if in chain
                     continue
+
+                # 4. Tier 4: OpenRouter Free Models
                 if prov == "openrouter" and settings.OPENROUTER_API_KEY:
                     if not _is_openrouter_over_limit():
                         _record_openrouter_usage()
                         llm, or_model = _get_openrouter_llm(mid)
                         return (llm, "openrouter", or_model)
                     continue
+
+                # 5. Tier 5: Mistral AI Free Tier
                 if prov == "mistral" and settings.MISTRAL_API_KEY:
                     if not _is_mistral_fallback_over_limit():
                         _record_mistral_fallback_usage()
                     llm, mistral_model = _get_mistral_llm()
                     return (llm, "mistral", mistral_model)
-            # No step succeeded: try Mistral if we have key (e.g. no Groq key)
-            if settings.MISTRAL_API_KEY:
-                if not _is_mistral_fallback_over_limit():
-                    _record_mistral_fallback_usage()
-                llm, mistral_model = _get_mistral_llm()
-                return (llm, "mistral", mistral_model)
+
+            # Fallbacks if loop exhausted
+            if settings.USE_VERTEX_AI and settings.GCP_PROJECT_ID and VERTEX_AVAILABLE:
+                try:
+                    llm, vmodel = _get_vertex_llm("gemini-2.5-flash")
+                    return (llm, "vertex", vmodel)
+                except Exception:
+                    pass
+
+            if settings.GOOGLE_API_KEY:
+                llm = ChatGoogleGenerativeAI(
+                    model="gemini-2.5-flash-lite",
+                    google_api_key=settings.GOOGLE_API_KEY,
+                    temperature=0.7,
+                    max_retries=1,
+                    convert_system_message_to_human=True,
+                )
+                return (llm, "google", "gemini-2.5-flash-lite")
+
             if settings.GROQ_API_KEY:
                 groq_model, _ = _pick_groq_fallback_model(0)
                 llm = ChatGroq(
@@ -339,18 +399,19 @@ class LLMFactory:
                     temperature=0.7,
                 )
                 return (llm, "groq", groq_model)
-            if not settings.GOOGLE_API_KEY:
-                raise ValueError("Google API Key is not set. Cannot use Gemini 2.5 Flash-Lite.")
-            llm = ChatGoogleGenerativeAI(
-                model="gemini-2.5-flash-lite",
-                google_api_key=settings.GOOGLE_API_KEY,
-                temperature=0.7,
-                max_retries=1,
-                convert_system_message_to_human=True,
-            )
-            return (llm, "google", "gemini-2.5-flash-lite")
+
+            raise ValueError("No viable LLM provider available. Check Vertex AI credentials or GOOGLE_API_KEY.")
 
         if provider == "google":
+            # Direct non-flash google request: Try Vertex first if enabled
+            if settings.USE_VERTEX_AI and settings.GCP_PROJECT_ID and VERTEX_AVAILABLE:
+                try:
+                    model = model_name or "gemini-2.5-flash"
+                    llm, vertex_model = _get_vertex_llm(model)
+                    return (llm, "vertex", vertex_model)
+                except Exception as ex:
+                    logger.warning(f"Vertex AI failed ({ex}), falling back to Google AI Studio.")
+
             if not settings.GOOGLE_API_KEY:
                 raise ValueError("Google API Key is not set in environment or .env file.")
             model = model_name or "gemini-2.5-flash"
@@ -366,7 +427,7 @@ class LLMFactory:
         if provider == "groq":
             if not settings.GROQ_API_KEY:
                 raise ValueError("Groq API Key is not set.")
-            model = model_name or "llama-3.3-70b-versatile"  # mixtral-8x7b-32768 was decommissioned
+            model = model_name or "llama-3.3-70b-versatile"
             llm = ChatGroq(
                 model_name=model,
                 groq_api_key=settings.GROQ_API_KEY,
@@ -411,10 +472,11 @@ class LLMFactory:
             llm, _ = _get_openrouter_llm(model)
             return (llm, "openrouter", model)
 
-        raise ValueError(f"Unsupported provider: {provider}. Supported: google, groq, anthropic, deepseek, mistral, openrouter.")
+        raise ValueError(f"Unsupported provider: {provider}. Supported: google, vertex, groq, anthropic, deepseek, mistral, openrouter.")
 
 
 def _is_rate_limit_error(e: Exception) -> bool:
+    """True on rate limits, quota limits, credit exhaustion, 403s, 429s, or 503s."""
     msg = str(e).lower()
     return (
         "resource_exhausted" in msg
@@ -423,23 +485,26 @@ def _is_rate_limit_error(e: Exception) -> bool:
         or "503" in msg
         or "unavailable" in msg
         or "overloaded" in msg
+        or "quota" in msg
+        or "billing" in msg
+        or "credit" in msg
+        or "permission" in msg
+        or "403" in msg
     )
 
 
 def invoke_with_fallback(message: str, provider: str = "google", model_name: str = None, prefer_model: str = None, system_prompt: str = None):
     """
     Invoke an LLM, cascading through the *entire* remaining FALLBACK_CHAIN on real
-    rate-limit failures (not just one hardcoded retry step). Only meaningful when
-    using the google/gemini-2.5-flash-lite entry point, since that's what drives
-    the chain; other providers are tried once as-is.
+    rate-limit / quota / billing failures.
 
     If ``system_prompt`` is provided, it is sent as a system message ahead of the
-    user message (Gemini converts it to a human turn automatically).
+    user message.
 
     Returns (ai_message, provider_used, model_used).
     """
     llm, provider_used, model_used = LLMFactory.get_llm(provider, model_name, prefer_model=prefer_model)
-    using_chain = (provider.lower() == "google" and (model_name in (None, "gemini-2.5-flash-lite")))
+    using_chain = (provider.lower() in ("google", "vertex") and (model_name in (None, "gemini-2.5-flash-lite", "gemini-2.5-flash")))
 
     # Build the invocation payload: a plain string, or system+human messages.
     payload = message if not system_prompt else [
@@ -457,8 +522,9 @@ def invoke_with_fallback(message: str, provider: str = "google", model_name: str
         LLM_REQUESTS_TOTAL.labels(provider=provider_used, model=model_used, status="error").inc()
         if not (using_chain and _is_rate_limit_error(e)):
             raise
+        logger.warning(f"Primary invocation ({provider_used}:{model_used}) failed with {e}. Cascading fallback chain...")
 
-    # Walk the rest of the chain, starting just after the model that just failed.
+    # Walk the rest of the chain, starting just after the model that failed.
     start_index = _fallback_chain_start_index(model_used) + 1
     for i in range(start_index, len(FALLBACK_CHAIN)):
         _prov, mid = FALLBACK_CHAIN[i]

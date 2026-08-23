@@ -1,25 +1,21 @@
-from langchain_google_genai import ChatGoogleGenerativeAI
-try:
-    from langchain_google_vertexai import ChatVertexAI
-    VERTEX_AVAILABLE = True
-except ImportError:
-    VERTEX_AVAILABLE = False
+import os
+import time
+import logging
+import threading
+from typing import Tuple, Optional, Any
+from datetime import datetime
+from zoneinfo import ZoneInfo
+from prometheus_client import Counter
 
+from google import genai
+from google.genai import types
 from langchain_anthropic import ChatAnthropic
 from langchain_openai import ChatOpenAI
 from langchain_groq import ChatGroq
 from langchain_mistralai import ChatMistralAI
 from langchain_core.language_models.chat_models import BaseChatModel
-from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
 from config import settings
-import os
-import time
-import logging
-import threading
-from typing import Tuple, Optional
-from datetime import datetime
-from zoneinfo import ZoneInfo
-from prometheus_client import Counter
 
 logger = logging.getLogger(__name__)
 
@@ -63,24 +59,22 @@ CHAT_SYSTEM_PROMPT = (
     "```"
 )
 
-# Active, verified models ordered by speed and capability
+# Active fallback chain: 1. Vertex AI ($300 GCP Credits) -> 2. Google AI Studio -> 3. Groq
 FALLBACK_CHAIN = (
-    ("google", "gemini-2.5-flash"),
+    ("vertex", "gemini-2.5-flash"),
+    ("vertex", "gemini-2.5-pro"),
     ("groq", "allam-2-7b"),
     ("groq", "qwen/qwen3.6-27b"),
     ("groq", "groq/compound"),
-    ("groq", "groq/compound-mini"),
     ("openrouter", "qwen/qwen3-coder:free"),
     ("mistral", "mistral-small-latest"),
 )
 SELECTABLE_FALLBACK_MODELS = [model_id for _, model_id in FALLBACK_CHAIN]
 
-# Groq active sub-chain
 _GROQ_FALLBACK_CHAIN = (
     ("allam-2-7b", 60, 7000),
     ("qwen/qwen3.6-27b", 60, 1000),
     ("groq/compound", 30, 250),
-    ("groq/compound-mini", 30, 250),
 )
 _groq_chain_state: dict = {}
 _limiter_lock = threading.Lock()
@@ -128,6 +122,61 @@ def _pick_groq_fallback_model(groq_start_index: int = 0) -> Tuple[str, bool]:
     return (chain_slice[0][0], False)
 
 
+class NativeGenAIWrapper:
+    """Fast, direct Google GenAI SDK wrapper supporting Vertex AI ($300 credits) and AI Studio."""
+    def __init__(self, model_name: str, vertexai: bool = False):
+        self.model_name = model_name
+        self.vertexai = vertexai
+        if vertexai:
+            self.client = genai.Client(
+                vertexai=True,
+                project=settings.GCP_PROJECT_ID,
+                location=settings.GCP_LOCATION
+            )
+        else:
+            key = settings.resolved_google_api_key
+            if not key:
+                raise ValueError("Google API key missing.")
+            self.client = genai.Client(api_key=key)
+
+    def invoke(self, payload: Any) -> AIMessage:
+        if isinstance(payload, list):
+            # Combine System & Human messages
+            sys_text = ""
+            user_text = ""
+            for msg in payload:
+                if isinstance(msg, SystemMessage):
+                    sys_text += msg.content + "\n\n"
+                elif isinstance(msg, HumanMessage):
+                    user_text += msg.content
+                elif hasattr(msg, "content"):
+                    user_text += str(msg.content)
+            prompt = (sys_text + user_text).strip()
+        else:
+            prompt = str(payload)
+
+        config = types.GenerateContentConfig(
+            temperature=0.7,
+        )
+        response = self.client.models.generate_content(
+            model=self.model_name,
+            contents=prompt,
+            config=config,
+        )
+        usage = getattr(response, "usage_metadata", None)
+        token_meta = {}
+        if usage:
+            token_meta = {
+                "prompt_tokens": getattr(usage, "prompt_token_count", 0),
+                "completion_tokens": getattr(usage, "candidates_token_count", 0),
+                "total_tokens": getattr(usage, "total_token_count", 0),
+            }
+        return AIMessage(
+            content=response.text or "",
+            response_metadata={"token_usage": token_meta, "model_name": self.model_name}
+        )
+
+
 def _get_openrouter_llm(model_name: str = "qwen/qwen3-coder:free") -> Tuple[BaseChatModel, str]:
     llm = ChatOpenAI(
         model=model_name,
@@ -151,134 +200,48 @@ def _get_mistral_llm(model_name: str = "mistral-small-latest") -> Tuple[BaseChat
     return (llm, model_name)
 
 
-def _get_vertex_llm(model_name: str = "gemini-2.5-flash") -> Tuple[BaseChatModel, str]:
-    if not (settings.USE_VERTEX_AI and settings.GCP_PROJECT_ID and VERTEX_AVAILABLE):
-        raise ValueError("Vertex AI is disabled, unconfigured, or package not available.")
-    
-    # Fast timeout to prevent ADC discovery hangs
-    llm = ChatVertexAI(
-        model_name=model_name,
-        project=settings.GCP_PROJECT_ID,
-        location=settings.GCP_LOCATION,
-        temperature=0.7,
-        timeout=4.0,
-        max_retries=0,
-    )
-    return (llm, model_name)
-
-
-def _fallback_chain_start_index(prefer_model: str | None) -> int:
-    if not (prefer_model and (prefer_model := prefer_model.strip())):
-        return 0
-    for i, (_prov, model_id) in enumerate(FALLBACK_CHAIN):
-        if model_id == prefer_model:
-            return i
-    return 0
-
-
 class LLMFactory:
     @staticmethod
     def get_llm(
         provider: str = "google",
         model_name: str = None,
         prefer_model: str = None,
-    ) -> Tuple[BaseChatModel, str, str]:
+    ) -> Tuple[Any, str, str]:
         provider = provider.lower()
         model_name = (model_name or "").strip() or None
         prefer_model = (prefer_model or "").strip() or None
         if prefer_model and prefer_model.lower() == "auto":
             prefer_model = None
 
-        google_key = settings.resolved_google_api_key
+        # 1. Vertex AI ($300 GCP Credits)
+        if provider == "vertex" or (provider in ("google", "default") and settings.USE_VERTEX_AI and settings.GCP_PROJECT_ID):
+            try:
+                vmodel = model_name or "gemini-2.5-flash"
+                wrapper = NativeGenAIWrapper(model_name=vmodel, vertexai=True)
+                return (wrapper, "vertex", vmodel)
+            except Exception as ex:
+                logger.warning(f"Vertex AI initialization failed ({ex}), falling back to Google AI Studio / Groq.")
 
-        # 1. Direct Vertex AI request (Fast timeout)
-        if provider == "vertex":
-            model = model_name or "gemini-2.5-flash"
-            llm, vertex_model = _get_vertex_llm(model)
-            return (llm, "vertex", vertex_model)
+        # 2. Google AI Studio (Free Tier)
+        if provider == "google" and settings.resolved_google_api_key:
+            try:
+                gmodel = model_name or "gemini-2.5-flash"
+                wrapper = NativeGenAIWrapper(model_name=gmodel, vertexai=False)
+                return (wrapper, "google", gmodel)
+            except Exception as ex:
+                logger.warning(f"Google AI Studio initialization failed ({ex}).")
 
-        # 2. Google / Default chain
-        if provider in ("google", "default") and (model_name is None or "gemini" in model_name):
-            start_index = _fallback_chain_start_index(prefer_model)
-            for i in range(start_index, len(FALLBACK_CHAIN)):
-                prov, mid = FALLBACK_CHAIN[i]
-
-                # Google AI Studio (Fast 4s timeout, max_retries 0)
-                if prov == "google" and google_key:
-                    try:
-                        llm = ChatGoogleGenerativeAI(
-                            model=mid,
-                            google_api_key=google_key,
-                            temperature=0.7,
-                            timeout=4.0,
-                            max_retries=0,
-                            convert_system_message_to_human=True,
-                        )
-                        return (llm, "google", mid)
-                    except Exception as ex:
-                        logger.warning(f"Google AI Studio model {mid} init failed ({ex}).")
-                    continue
-
-                # Groq Active Models (Lightning Fast ~0.5s)
-                if prov == "groq" and settings.GROQ_API_KEY:
-                    groq_model, _ = _pick_groq_fallback_model(0)
-                    llm = ChatGroq(
-                        model_name=groq_model,
-                        groq_api_key=settings.GROQ_API_KEY,
-                        temperature=0.7,
-                        timeout=5.0,
-                        max_retries=0,
-                    )
-                    return (llm, "groq", groq_model)
-
-                # OpenRouter
-                if prov == "openrouter" and settings.OPENROUTER_API_KEY:
-                    llm, or_model = _get_openrouter_llm(mid)
-                    return (llm, "openrouter", or_model)
-
-                # Mistral
-                if prov == "mistral" and settings.MISTRAL_API_KEY:
-                    llm, mistral_model = _get_mistral_llm()
-                    return (llm, "mistral", mistral_model)
-
-            # Fallback to Groq if Google key missing
-            if settings.GROQ_API_KEY:
-                groq_model, _ = _pick_groq_fallback_model(0)
-                llm = ChatGroq(
-                    model_name=groq_model,
-                    groq_api_key=settings.GROQ_API_KEY,
-                    temperature=0.7,
-                    timeout=5.0,
-                    max_retries=0,
-                )
-                return (llm, "groq", groq_model)
-
-        if provider == "google":
-            if not google_key:
-                raise ValueError("Google API Key is not configured.")
-            model = model_name or "gemini-2.5-flash"
-            llm = ChatGoogleGenerativeAI(
-                model=model,
-                google_api_key=google_key,
-                temperature=0.7,
-                timeout=4.0,
-                max_retries=0,
-                convert_system_message_to_human=True,
-            )
-            return (llm, "google", model)
-
-        if provider == "groq":
-            if not settings.GROQ_API_KEY:
-                raise ValueError("Groq API Key is not set.")
-            model = model_name or "allam-2-7b"
+        # 3. Groq (Ultra-Fast ~0.5s)
+        if (provider in ("groq", "google", "default")) and settings.GROQ_API_KEY:
+            groq_model, _ = _pick_groq_fallback_model(0)
             llm = ChatGroq(
-                model_name=model,
+                model_name=groq_model,
                 groq_api_key=settings.GROQ_API_KEY,
                 temperature=0.7,
                 timeout=5.0,
                 max_retries=0,
             )
-            return (llm, "groq", model)
+            return (llm, "groq", groq_model)
 
         if provider == "anthropic":
             if not settings.ANTHROPIC_API_KEY:
@@ -331,6 +294,7 @@ def invoke_with_fallback(message: str, provider: str = "google", model_name: str
     ]
 
     last_exc = None
+    # 1. Try primary configured model (Vertex AI with $300 Credits)
     try:
         llm, provider_used, model_used = LLMFactory.get_llm(provider, model_name, prefer_model=prefer_model)
         ai_message = llm.invoke(payload)
@@ -338,22 +302,20 @@ def invoke_with_fallback(message: str, provider: str = "google", model_name: str
         return (ai_message, provider_used, model_used)
     except Exception as e:
         last_exc = e
-        LLM_REQUESTS_TOTAL.labels(provider=provider or "google", model=model_name or "default", status="error").inc()
+        LLM_REQUESTS_TOTAL.labels(provider=provider or "vertex", model=model_name or "gemini-2.5-flash", status="error").inc()
         logger.warning(f"Primary ({provider}:{model_name}) failed with {type(e).__name__}: {e}. Cascading fallback...")
 
-    # Fast fallback through active tiers
-    start_index = _fallback_chain_start_index(prefer_model)
-    for i in range(start_index, len(FALLBACK_CHAIN)):
-        _prov, mid = FALLBACK_CHAIN[i]
+    # 2. Cascade down the fallback tiers
+    for prov, mid in FALLBACK_CHAIN:
         try:
-            llm, provider_used, model_used = LLMFactory.get_llm("google", None, prefer_model=mid)
+            llm, provider_used, model_used = LLMFactory.get_llm(prov, mid)
             ai_message = llm.invoke(payload)
             LLM_REQUESTS_TOTAL.labels(provider=provider_used, model=model_used, status="success").inc()
             return (ai_message, provider_used, model_used)
         except Exception as e:
             last_exc = e
-            LLM_REQUESTS_TOTAL.labels(provider=_prov, model=mid, status="error").inc()
-            logger.warning(f"Fallback ({_prov}:{mid}) failed with {type(e).__name__}: {e}.")
+            LLM_REQUESTS_TOTAL.labels(provider=prov, model=mid, status="error").inc()
+            logger.warning(f"Fallback ({prov}:{mid}) failed with {type(e).__name__}: {e}.")
             continue
 
     raise last_exc or RuntimeError("All LLM providers and fallback tiers failed.")
